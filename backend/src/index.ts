@@ -4,15 +4,15 @@ import { Server } from "socket.io";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
+import { askLLM } from "./services/openai"; // LLM function
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-  },
+  cors: { origin: "*" },
 });
 
+// Paths
 const RECORDINGS_DIR = path.join(__dirname, "../recordings");
 const WHISPER_DIR = path.join(__dirname, "../whisper");
 
@@ -32,7 +32,7 @@ io.on("connection", (socket) => {
 
   sessions[socket.id] = { ffmpeg: null, filePath: null };
 
-  // Start recording
+  // START RECORDING
   socket.on("start-audio", () => {
     console.log("🎤 START recording:", socket.id);
 
@@ -50,19 +50,20 @@ io.on("connection", (socket) => {
     ]);
 
     ffmpeg.stderr.on("data", (d) => console.log("FFmpeg:", d.toString()));
+
     ffmpeg.on("close", () => {
-      console.log("🎵 WAV saved:", filePath);
+      console.log("🎵 Saved WAV:", filePath);
 
       socket.emit("wav-ready", { path: filePath });
 
-      // 🔥 AUTO RUN WHISPER HERE
-      runWhisper(socket.id, filePath);
+      // ⬇️ Process with Whisper automatically
+      runWhisperAndLLM(socket.id, filePath);
     });
 
     sessions[socket.id].ffmpeg = ffmpeg;
   });
 
-  // Receive PCM audio chunks
+  // AUDIO CHUNKS
   socket.on("audio-chunk", (chunk: ArrayBuffer) => {
     const session = sessions[socket.id];
     if (session.ffmpeg) {
@@ -70,20 +71,25 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Stop recording
+  // STOP RECORDING
   socket.on("audio-stream-end", () => {
     console.log("🛑 STOP recording:", socket.id);
-    sessions[socket.id].ffmpeg?.stdin.end();
+    const s = sessions[socket.id];
+    if (s?.ffmpeg) s.ffmpeg.stdin.end();
   });
 
+  // DISCONNECT
   socket.on("disconnect", () => {
-    console.log("🔴 Client left:", socket.id);
+    console.log("🔴 Client disconnected:", socket.id);
     sessions[socket.id]?.ffmpeg?.stdin.end();
     delete sessions[socket.id];
   });
 });
 
-function runWhisper(socketId: string, filePath: string) {
+// ---------------------------------------------
+// 🔥 WHISPER + LLM FUNCTION
+// ---------------------------------------------
+async function runWhisperAndLLM(socketId: string, filePath: string) {
   console.log("🧠 Running Whisper on:", filePath);
 
   const whisperPath = path.join(WHISPER_DIR, "main.exe");
@@ -92,9 +98,9 @@ function runWhisper(socketId: string, filePath: string) {
   const whisper = spawn(whisperPath, [
     "-m", modelPath,
     "-f", filePath,
-    "-t", "4"  // correct thread flag
+    "-t", "4",
+    "--no-timestamps" // cleaner output
   ]);
-  
 
   let output = "";
 
@@ -106,23 +112,37 @@ function runWhisper(socketId: string, filePath: string) {
     console.log("Whisper:", data.toString());
   });
 
-  whisper.on("close", () => {
+  whisper.on("close", async () => {
     console.log("🧠 Whisper finished!");
 
-    // Extract recognized text
-    const lines = output.split("\n");
-    const transcriptLines = lines.filter(l => l.includes("]   "));
-    const finalText = transcriptLines
-      .map(l => l.split("]   ")[1])
-      .join(" ");
+    // Extract final text
+    const transcript = extractTranscript(output);
+    console.log("📄 TRANSCRIPT:", transcript);
 
-    console.log("📄 TRANSCRIPT:", finalText);
+    io.to(socketId).emit("transcript", { text: transcript });
 
-    // Send text back to frontend
-    io.to(socketId).emit("transcript", { text: finalText });
+    // Call LLM
+    const llmReply = await askLLM(transcript);
+    console.log("🤖 LLM Reply:", llmReply);
+
+    io.to(socketId).emit("llm-reply", { text: llmReply });
   });
 }
 
+// ---------------------------------------------
+// 🔥 CLEAN TRANSCRIPT EXTRACTOR
+// ---------------------------------------------
+function extractTranscript(raw: string): string {
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("whisper_"))
+    .filter((l) => !l.includes("error"))
+    .filter((l) => !/^\[\d\d:/.test(l)) // remove [00:00:00]
+    .join(" ")
+    .trim();
+}
+
 server.listen(4000, () => {
-  console.log("🚀 Backend running on http://localhost:4000");
+  console.log("🚀 Backend running at http://localhost:4000");
 });
