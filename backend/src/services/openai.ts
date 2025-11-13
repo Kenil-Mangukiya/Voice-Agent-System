@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+console.log("openai key is : ",process.env.OPENAI_API_KEY);
 if (!process.env.OPENAI_API_KEY) {
   throw new Error("❌ OPENAI_API_KEY missing in .env");
 }
