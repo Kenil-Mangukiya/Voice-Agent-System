@@ -4,19 +4,20 @@ import { Server } from "socket.io";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
-import { askLLM } from "./services/openai"; // LLM function
+import { askLLM } from "./services/openai";
+import { textToSpeech } from "./services/tts";
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-// Paths
 const RECORDINGS_DIR = path.join(__dirname, "../recordings");
 const WHISPER_DIR = path.join(__dirname, "../whisper");
 
-// Ensure folders exist
+// Create folders if missing
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR);
 if (!fs.existsSync(WHISPER_DIR)) fs.mkdirSync(WHISPER_DIR);
 
@@ -32,7 +33,7 @@ io.on("connection", (socket) => {
 
   sessions[socket.id] = { ffmpeg: null, filePath: null };
 
-  // START RECORDING
+  // 1️⃣ CLIENT STARTS AUDIO STREAM
   socket.on("start-audio", () => {
     console.log("🎤 START recording:", socket.id);
 
@@ -52,18 +53,16 @@ io.on("connection", (socket) => {
     ffmpeg.stderr.on("data", (d) => console.log("FFmpeg:", d.toString()));
 
     ffmpeg.on("close", () => {
-      console.log("🎵 Saved WAV:", filePath);
+      console.log("🎵 WAV saved:", filePath);
 
-      socket.emit("wav-ready", { path: filePath });
-
-      // ⬇️ Process with Whisper automatically
-      runWhisperAndLLM(socket.id, filePath);
+      // Whisper Auto-Run
+      runWhisper(socket, filePath);
     });
 
     sessions[socket.id].ffmpeg = ffmpeg;
   });
 
-  // AUDIO CHUNKS
+  // 2️⃣ RECEIVE RAW AUDIO CHUNKS
   socket.on("audio-chunk", (chunk: ArrayBuffer) => {
     const session = sessions[socket.id];
     if (session.ffmpeg) {
@@ -71,26 +70,25 @@ io.on("connection", (socket) => {
     }
   });
 
-  // STOP RECORDING
+  // 3️⃣ STOP STREAM
   socket.on("audio-stream-end", () => {
     console.log("🛑 STOP recording:", socket.id);
-    const s = sessions[socket.id];
-    if (s?.ffmpeg) s.ffmpeg.stdin.end();
+    sessions[socket.id].ffmpeg?.stdin.end();
   });
 
-  // DISCONNECT
   socket.on("disconnect", () => {
-    console.log("🔴 Client disconnected:", socket.id);
+    console.log("🔴 Client left:", socket.id);
     sessions[socket.id]?.ffmpeg?.stdin.end();
     delete sessions[socket.id];
   });
 });
 
-// ---------------------------------------------
-// 🔥 WHISPER + LLM FUNCTION
-// ---------------------------------------------
-async function runWhisperAndLLM(socketId: string, filePath: string) {
-  console.log("🧠 Running Whisper on:", filePath);
+// -----------------------------------------------------
+// 🔥 RUN WHISPER & PROCESS SPEECH → TEXT → LLM → TTS
+// -----------------------------------------------------
+
+function runWhisper(socket: any, filePath: string) {
+  console.log("🧠 Running Whisper:", filePath);
 
   const whisperPath = path.join(WHISPER_DIR, "main.exe");
   const modelPath = path.join(WHISPER_DIR, "models/ggml-base.en.bin");
@@ -99,13 +97,13 @@ async function runWhisperAndLLM(socketId: string, filePath: string) {
     "-m", modelPath,
     "-f", filePath,
     "-t", "4",
-    "--no-timestamps" // cleaner output
+    "-osrt",
   ]);
 
-  let output = "";
+  let rawOutput = "";
 
   whisper.stdout.on("data", (data) => {
-    output += data.toString();
+    rawOutput += data.toString();
   });
 
   whisper.stderr.on("data", (data) => {
@@ -113,36 +111,46 @@ async function runWhisperAndLLM(socketId: string, filePath: string) {
   });
 
   whisper.on("close", async () => {
-    console.log("🧠 Whisper finished!");
+    console.log("🧠 Whisper Finished!");
 
-    // Extract final text
-    const transcript = extractTranscript(output);
+    // Extract lines like:
+    // [00:00:00.000 --> 00:00:02.000]   Hello world
+    const lines = rawOutput.split("\n");
+    const transcriptLines = lines.filter((l) => l.includes("]   "));
+
+    const transcript = transcriptLines
+      .map((l) => l.split("]   ")[1])
+      .join(" ")
+      .trim();
+
     console.log("📄 TRANSCRIPT:", transcript);
 
-    io.to(socketId).emit("transcript", { text: transcript });
+    if (!transcript || transcript.length < 1) {
+      console.log("⚠ Empty transcript");
+      socket.emit("transcript", { text: "" });
+      return;
+    }
 
-    // Call LLM
-    const llmReply = await askLLM(transcript);
-    console.log("🤖 LLM Reply:", llmReply);
+    // Send transcript to frontend
+    socket.emit("transcript", { text: transcript });
 
-    io.to(socketId).emit("llm-reply", { text: llmReply });
+    // Ask LLM for response
+    console.log("🤖 Asking LLM...");
+    const reply = await askLLM(transcript);
+    console.log("💬 LLM Reply:", reply);
+
+    socket.emit("llm-text", { text: reply });
+
+    // Convert LLM text → Speech via XTTS
+    console.log("🎙 Generating TTS...");
+    const audioBuffer = await textToSpeech(reply);
+
+    // Send audio to frontend
+    socket.emit("tts-audio", audioBuffer);
+    console.log("🔊 TTS Sent to client");
   });
 }
 
-// ---------------------------------------------
-// 🔥 CLEAN TRANSCRIPT EXTRACTOR
-// ---------------------------------------------
-function extractTranscript(raw: string): string {
-  return raw
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("whisper_"))
-    .filter((l) => !l.includes("error"))
-    .filter((l) => !/^\[\d\d:/.test(l)) // remove [00:00:00]
-    .join(" ")
-    .trim();
-}
-
-server.listen(4000, () => {
-  console.log("🚀 Backend running at http://localhost:4000");
-});
+server.listen(4000, () =>
+  console.log("🚀 Backend running at http://localhost:4000")
+);
